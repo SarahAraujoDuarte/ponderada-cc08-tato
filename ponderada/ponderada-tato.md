@@ -96,7 +96,7 @@ Outra forma de conferir é separar a parte não acelerada da acelerada: `7,5 × 
 
 ### Por que V precisa de cache e H funciona sem?
 
-A Plataforma V compartilha o caminho para as instruções e dados e usa DRAM muito mais lenta que o processador. Sem cache, o gargalo de Von Neumann faria a CPU esperar a memória com frequência. A cache mantém instruções e os dados recentes próximos da CPU. Já a H separa instruções e dados e usa SRAM interna de um ciclo, compatível com seu clock menor. Por conta disso, ela não depende de cache para esconder a latência da memória.
+A Plataforma V compartilha o caminho para instruções e dados e usa DRAM muito mais lenta que o processador; sem cache, o gargalo de Von Neumann faria a CPU esperar a memória com frequência. A cache mantém instruções e dados recentes próximos da CPU. Já a H separa instruções e dados e usa SRAM interna de um ciclo, compatível com seu clock menor. Por isso ela não depende de cache para esconder a latência da memória.
 
 ### Evidência da máquina
 
@@ -180,11 +180,11 @@ Não há bolhas: o total é o mínimo ideal de `7 + 4 = 11 ciclos`.
 
 ### Proposta
 
-Eu criaria um **processo principal de tempo crítico** com três threads: sensor, processamento e motor. Elas formam um pipeline curto, precisam trocar cada amostra com baixa latência e podem compartilhar buffers em memória. Threads têm criação e troca de contexto mais baratas que processos, embora o buffer compartilhado exija sincronização.
+Eu colocaria sensor, processamento e motor como três threads de um **processo principal**. As três tarefas trabalham em sequência e precisam trocar cada amostra rapidamente. Como são threads, elas podem usar o mesmo buffer na memória e têm um custo menor de criação e troca de contexto. O cuidado necessário é sincronizar o acesso ao buffer compartilhado.
 
-O BLE ficaria em um **processo separado**, com privilégios mínimos. A comunicação com o processo principal seria feita por uma fila IPC limitada: o processo principal envia cópias dos logs e recebe somente comandos validados. A troca por IPC tem algum custo, mas o BLE não está no caminho sensor→processamento→motor e não deve bloquear esse caminho.
+O BLE ficaria em um **processo separado**, com apenas as permissões necessárias. Ele conversaria com o processo principal por uma fila de comunicação entre processos, também chamada de IPC. O processo principal enviaria cópias dos logs e aceitaria somente comandos validados. Essa comunicação tem um pequeno custo, mas o BLE não faz parte do caminho mais crítico, que é sensor→processamento→motor.
 
-Se o BLE vulnerável fosse uma thread, uma exploração teria acesso à mesma memória, aos buffers e aos ponteiros do processo principal; um crash também derrubaria todas as threads. Como processo separado, o sistema operacional fornece espaço de endereçamento e permissões próprios: uma falha pode encerrar ou comprometer o BLE sem necessariamente parar a vibração. Isso reduz o impacto, embora não elimine a necessidade de validar as mensagens IPC.
+Se o BLE fosse uma thread e alguém explorasse uma falha nele, o invasor poderia acessar a mesma memória usada pelo sensor e pelo motor. Uma falha grave também poderia derrubar todo o processo. Como processo separado, o BLE tem sua própria área de memória e suas próprias permissões. Assim, ele pode falhar sem necessariamente interromper a vibração. Mesmo com essa separação, as mensagens recebidas pelo processo principal ainda precisam ser validadas.
 
 ### Estados de um processo
 
@@ -234,7 +234,7 @@ O código está em [`codigo/`](codigo/). Cada versão foi executada três vezes 
 
 ### Análise da versão 1
 
-A região crítica inclui verificar `ocupadas`, acessar a posição do buffer, avançar o índice e atualizar o contador compartilhado. A operação lógica `ocupadas = ocupadas ± 1` não é atômica: ela faz uma leitura, calcula e depois escreve. O `sleep(0)` permite que as duas threads leiam o mesmo valor antes das escritas; a última escrita sobrescreve a outra atualização. Assim, contador, índices e conteúdo deixam de representar o mesmo estado. Isso pode fazer uma posição ser sobrescrita antes do consumo (perda), ser lida mais de uma vez (duplicação) ou levar as threads a uma espera sem progresso. Nestas três execuções houve perdas e duas atingiram o timeout, mas não apareceram duplicações; uma condição de corrida é, por definição, dependente do escalonamento.
+A região crítica é o trecho que verifica `ocupadas`, acessa o buffer, avança o índice e atualiza o contador. A operação `ocupadas = ocupadas ± 1` não acontece de uma vez: primeiro a thread lê o valor e depois grava o resultado. O `sleep(0)` permite uma troca de thread entre essas duas etapas. As duas threads podem ler o mesmo valor e uma escrita acaba apagando o resultado da outra. Com isso, o contador deixa de representar o conteúdo real do buffer. Uma amostra pode ser sobrescrita antes do consumo, lida mais de uma vez ou as threads podem ficar sem progresso. Nas três execuções houve perdas e duas chegaram ao timeout. Não apareceram duplicações nessas rodadas, mas o resultado pode mudar conforme o escalonamento das threads.
 
 ### O que garante cada semáforo na versão 2
 
@@ -284,20 +284,20 @@ O ciclo `i2c → sensor → log → thread_log → ble → thread_config → i2c
 
 ### Duas correções
 
-**1. Prevenção por ordem global de locks.** Definir `i2c < log < ble` e exigir que toda thread adquira múltiplos recursos nessa ordem. `thread_config`, por exemplo, deve obter I2C antes de BLE (ou, preferencialmente, receber e copiar o comando sob BLE, liberar BLE e só depois obter I2C). Isso elimina a espera circular. Para a pessoa usuária, a pulseira deixa de congelar; o possível custo é uma pequena espera para configuração ou envio de log, atividades menos críticas que a vibração.
+**1. Prevenção com uma ordem única.** Pode-se definir a ordem `i2c < log < ble` e obrigar todas as threads a seguir essa ordem ao pedir mais de um recurso. A `thread_config`, por exemplo, deve obter I2C antes de BLE. Outra opção é copiar o comando, liberar BLE e só depois obter I2C. Dessa forma, o ciclo de espera deixa de existir. Para quem usa a pulseira, a vantagem é evitar o congelamento. O custo pode ser um pequeno atraso na configuração ou no envio de logs, que são menos críticos que a vibração.
 
-**2. Detecção e recuperação por timeout.** Usar aquisição temporizada no segundo semáforo. Se o prazo curto expirar, a thread registra o evento, libera o primeiro recurso e tenta novamente após um recuo aleatório. Um monitor pode detectar tentativas repetidas e reiniciar somente o módulo não crítico. Para a pessoa usuária, um log pode atrasar e um comando pode precisar ser reenviado, mas o caminho sensor→motor continua funcionando; também há custo de testes para garantir que rollback e repetição não deixem estado parcial.
+**2. Detecção e recuperação por timeout.** A thread pode esperar o segundo semáforo somente por um tempo limitado. Se esse tempo acabar, ela registra o problema, libera o primeiro recurso e tenta novamente depois de uma pequena espera. Um monitor também pode reiniciar somente o módulo que falhou. Para quem usa a pulseira, um log pode atrasar ou um comando pode precisar ser enviado de novo, mas a vibração continua funcionando. Essa solução exige testes para garantir que nenhuma operação fique pela metade.
 
 # Parte B — A decisão do CTO
 
 ## Memorando ao conselho — Dilema 2: processador de produção
 
-**Decido produzir a pulseira com a Plataforma H e o acelerador DSP.** A configuração custa R$ 37 por unidade (R$ 22 + R$ 15), contra R$ 70 da Plataforma V, e entrega a amostra em 3,9 ms, abaixo do limite obrigatório de 5 ms. Em 2.000 unidades, a diferença direta é de R$ 66.000, mas o motivo principal é a previsibilidade: a H com DSP mantém margem de 1,1 ms sem um sistema operacional interrompendo a tarefa.
+**Decido produzir a pulseira com a Plataforma H e o acelerador DSP.** Essa opção custa R$ 37 por unidade, enquanto a Plataforma V custa R$ 70. Em 2.000 unidades, a diferença é de R$ 66.000. Mais importante que o preço é o tempo de resposta: a H com DSP processa cada amostra em 3,9 ms e fica 1,1 ms abaixo do limite de 5 ms. Ela também não tem um sistema operacional que possa interromper a tarefa no momento errado.
 
-Estou abrindo mão de atualização remota. Cada firmware da H precisará de cabo e assistência técnica; a empresa paga por manutenção, logística e evolução mais lenta, enquanto a pessoa usuária paga com deslocamento ou tempo sem a pulseira. Também perdemos parte da flexibilidade do Linux para incluir recursos futuros. Esse custo deve ser reduzido com testes extensivos antes da fabricação, firmware modular, versionamento de hardware e atendimento que ofereça substituição temporária durante atualizações críticas.
+Ao escolher a H, estou abrindo mão das atualizações pela internet. Para atualizar o firmware, a pulseira terá que ser levada à assistência técnica e conectada por cabo. A empresa terá custos de atendimento e logística, e a pessoa usuária poderá ficar um tempo sem o produto. Também será mais difícil adicionar novas funções. Para diminuir esse problema, o firmware deve ser muito bem testado antes da fabricação e a empresa deve oferecer uma troca rápida em atualizações importantes.
 
-A Plataforma V é mais rápida em média: 1,916 ms por amostra. Porém, o pior caso calculado, já com a interrupção de 3 ms do Linux, chega a **4,916 ms**. A margem é de apenas 0,084 ms. Para um produto no qual uma amostra atrasada pode esconder um obstáculo, não considero responsável transformar uma estimativa de pior caso tão apertada em compromisso de segurança. O Linux e a atualização OTA também ampliam a superfície de ataque; na H, o software menor, sem serviços de rede gerais, é mais simples de auditar. A H ainda exige boot seguro, firmware assinado e proteção da interface física, portanto a escolha reduz riscos, mas não os elimina.
+A Plataforma V é mais rápida na média, com 1,916 ms por amostra. O problema aparece no pior caso: com a interrupção de até 3 ms do Linux, o tempo chega a **4,916 ms**. A margem é de apenas 0,084 ms. Isso é muito pouco para um produto de segurança. Além disso, Linux e atualização pela internet aumentam os pontos que podem ser atacados. A Plataforma H tem um software menor e mais simples de verificar. Mesmo assim, ela ainda precisa de inicialização segura, firmware assinado e proteção da conexão física.
 
-Para quem usa a pulseira, a vantagem escolhida é resposta mais determinística e menor risco de silêncio inesperado na vibração. O impacto negativo é receber correções com mais lentidão. Uma vulnerabilidade crítica exigiria campanha de assistência, então manteremos um processo de divulgação de falhas e estoque para troca rápida.
+Para quem usa a pulseira, a principal vantagem é ter uma resposta mais previsível e menor risco de ficar sem vibração diante de um obstáculo. A desvantagem é que correções de software chegarão mais devagar. Se surgir uma falha grave, a empresa deverá avisar os usuários e organizar a atualização ou troca das pulseiras rapidamente.
 
-Eu mudaria para a Plataforma V se um protótipo com kernel de tempo real, BLE ativo e carga máxima demonstrasse, em teste de pelo menos 10 milhões de amostras, tempo máximo de até **4,0 ms**, sem perda, e se boot verificado mais atualizações OTA assinadas fossem auditados independentemente. Essa evidência daria 1 ms de margem real e faria a capacidade de corrigir remotamente superar o custo e a complexidade adicionais.
+Eu mudaria de ideia se a Plataforma V, usando um Linux de tempo real, BLE ativo e carga máxima, processasse pelo menos 10 milhões de amostras sem perdas e nunca passasse de **4,0 ms**. Também seria necessário comprovar que a inicialização e as atualizações pela internet são seguras. Nesse caso, haveria uma margem real de 1 ms e a atualização remota poderia compensar o preço e a complexidade maiores.
