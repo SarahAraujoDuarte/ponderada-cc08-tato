@@ -214,9 +214,9 @@ O código está em [`codigo/`](codigo/). Cada versão foi executada três vezes 
 
 | Versão | Execução | Consumidas | Perdidas | Duplicadas | Travou? |
 |---|---:|---:|---:|---:|:---:|
-| 1 — sem sincronização | 1 | 17.901 | 2.099 | 0 | Não |
-| 1 — sem sincronização | 2 | 17.536 | 2.464 | 0 | Sim |
-| 1 — sem sincronização | 3 | 17.813 | 2.187 | 0 | Sim |
+| 1 — sem sincronização | 1 | 17.731 | 2.269 | 0 | Sim |
+| 1 — sem sincronização | 2 | 17.303 | 2.697 | 0 | Sim |
+| 1 — sem sincronização | 3 | 17.564 | 2.436 | 0 | Não |
 | 2 — semáforos corretos | 1 | 20.000 | 0 | 0 | Não |
 | 2 — semáforos corretos | 2 | 20.000 | 0 | 0 | Não |
 | 2 — semáforos corretos | 3 | 20.000 | 0 | 0 | Não |
